@@ -44,6 +44,8 @@ const (
 	ClassInvalid
 	// ClassRetryable 可重试失败（临时故障）。
 	ClassRetryable
+	// ClassManual 重试预算耗尽，进入需要人工介入的终态（与其他失败可区分）。
+	ClassManual
 )
 
 // DeviceReport 是设备上报给编排器的一帧报文。
@@ -125,6 +127,9 @@ type Plan struct {
 	Protocol    Semver
 	Batches     []BatchSpec
 	MaxAttempts int
+	// MaxRollbackAttempts 是单台设备回滚任务的重试预算（含首次下发）。
+	// <= 0 时回落为 MaxAttempts。预算耗尽后设备进入需人工介入的终态。
+	MaxRollbackAttempts int
 	// MaxFailRate / MaxRollbackRate 为允许的上限（含边界），超过即暂停并回滚。
 	MaxFailRate     float64
 	MaxRollbackRate float64

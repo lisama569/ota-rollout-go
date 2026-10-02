@@ -38,13 +38,13 @@ func main() {
 	}
 
 	devs := []*ota.SimDevice{
-		{ID: "s1", Protocol: ota.Semver{Major: 1}, Behavior: ota.BehSuccess, ExtraDuplicates: 1},
-		{ID: "s2", Protocol: ota.Semver{Major: 1}, Behavior: ota.BehRetryThenSuccess, FailBefore: 1},
-		{ID: "s3", Protocol: ota.Semver{Major: 2}, Behavior: ota.BehIncompatible},
-		{ID: "s4", Protocol: ota.Semver{Major: 1}, Behavior: ota.BehSuccess, MalformedFirst: true},
-		{ID: "s5", Protocol: ota.Semver{Major: 1}, Behavior: ota.BehSuccess},
-		{ID: "s6", Protocol: ota.Semver{Major: 1}, Behavior: ota.BehSuccess},
-		{ID: "s7", Protocol: ota.Semver{Major: 1}, Behavior: ota.BehSuccess},
+		{ID: "s1", Protocol: ota.Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: ota.BehSuccess, ExtraDuplicates: 1},
+		{ID: "s2", Protocol: ota.Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: ota.BehRetryThenSuccess, FailBefore: 1},
+		{ID: "s3", Protocol: ota.Semver{Major: 2}, CurrentVer: "1.0.0", Behavior: ota.BehIncompatible},
+		{ID: "s4", Protocol: ota.Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: ota.BehSuccess, MalformedFirst: true},
+		{ID: "s5", Protocol: ota.Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: ota.BehSuccess},
+		{ID: "s6", Protocol: ota.Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: ota.BehSuccess},
+		{ID: "s7", Protocol: ota.Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: ota.BehSuccess},
 	}
 
 	store := ota.NewFileStore(*statePath)
@@ -54,19 +54,22 @@ func main() {
 	}
 	o := ota.NewOrchestrator(ota.Config{Plan: plan, Store: store, Transport: tr})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
 	trDone := make(chan struct{})
 	go func() { tr.Run(ctx); close(trDone) }()
 
-	if err := o.Run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
+	runErr := o.Run(ctx)
+	// 流程走完立即收尾：先停掉模拟传输（设备协程退出、通道关闭），
+	// 进程自行退出，不依赖任何外部超时兜底。
+	cancel()
+	<-trDone
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "run failed: %v\n", runErr)
 		os.Exit(1)
 	}
 	st := o.State()
 	fmt.Printf("\n=== demo finished: phase=%s currentBatch=%d stateFile=%s ===\n",
 		phaseName(st.Phase), st.CurrentBatch, *statePath)
-	<-trDone
 }
 
 func phaseName(p ota.RolloutPhase) string {

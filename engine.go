@@ -38,6 +38,75 @@ func (o *Orchestrator) inFlightLocked(b BatchIndex) int {
 	return n
 }
 
+// inFlightAllLocked 统计全部批次在途的升级/回滚任务数（回滚波次可能跨批次，
+// 整体配额约束必须覆盖两条链路，不能把设备打满）。
+func (o *Orchestrator) inFlightAllLocked() (upgrade, rollback int) {
+	for _, d := range o.st.Devices {
+		switch d.Phase {
+		case PhaseUpgradeInflight:
+			upgrade++
+		case PhaseRollbackInflight:
+			rollback++
+		}
+	}
+	return upgrade, rollback
+}
+
+// rollbackQuotaLocked 返回回滚波次的在途配额：沿用触发回滚时当前批次的配额，
+// 升级与回滚两条链路的在途总数不得超过它。
+func (o *Orchestrator) rollbackQuotaLocked() int {
+	cur := int(o.st.CurrentBatch)
+	if cur < 0 || cur >= len(o.cfg.Plan.Batches) {
+		return 1
+	}
+	if q := o.cfg.Plan.Batches[cur].MaxInFlight; q > 0 {
+		return q
+	}
+	return 1
+}
+
+// rollbackBudget 返回单台设备回滚任务的重试预算（含首次下发）。
+func (p *Plan) rollbackBudget() int {
+	if p.MaxRollbackAttempts > 0 {
+		return p.MaxRollbackAttempts
+	}
+	return p.MaxAttempts
+}
+
+// InflightStats 是升级/回滚两条链路在途与排队情况的一眼快照。
+type InflightStats struct {
+	Quota            int // 当前生效的在途配额（发布期为当前批次配额，回滚期为回滚配额）
+	UpgradeInflight  int // 升级任务在途数
+	RollbackInflight int // 回滚任务在途数
+	RollbackQueued   int // 已升级未回滚、正在排队等名额的设备数
+}
+
+// Stats 返回当前在途/排队快照，供运维观测与测试断言。
+func (o *Orchestrator) Stats() InflightStats {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.statsLocked()
+}
+
+func (o *Orchestrator) statsLocked() InflightStats {
+	var s InflightStats
+	if o.st == nil {
+		return s
+	}
+	s.UpgradeInflight, s.RollbackInflight = o.inFlightAllLocked()
+	for _, rec := range o.st.Devices {
+		if rec.Phase == PhaseUpgraded {
+			s.RollbackQueued++
+		}
+	}
+	if o.st.Phase == RolloutRollingBack {
+		s.Quota = o.rollbackQuotaLocked()
+	} else if int(o.st.CurrentBatch) < len(o.cfg.Plan.Batches) {
+		s.Quota = o.cfg.Plan.Batches[int(o.st.CurrentBatch)].MaxInFlight
+	}
+	return s
+}
+
 // dispatchPendingLocked 在当前批次配额内给待升级设备下发首次升级任务。
 func (o *Orchestrator) dispatchPendingLocked() {
 	if o.st.Phase != RolloutRunning {
@@ -202,8 +271,10 @@ func (o *Orchestrator) evaluateRunningLocked(trigger DeviceID) error {
 	return o.persistLocked()
 }
 
-// triggerRollbackLocked 暂停后续放量并对所有“已经升级到新版本”的设备下发回滚任务。
-// 尚未开始、失败耗尽、不可兼容的设备不在新固件上，直接落为安全终态，不再下发。
+// triggerRollbackLocked 暂停后续放量并进入回滚波次。
+// 尚未开始、失败耗尽、不可兼容的设备不在新固件上，直接落为安全终态，不再下发；
+// 已升级（upgraded）的设备不立即全量下发，而是进入回滚队列，由
+// pumpRollbackQueueLocked 按配额与固定顺序逐台放行。
 func (o *Orchestrator) triggerRollbackLocked(reason string) error {
 	if o.st.Phase != RolloutRunning {
 		return nil
@@ -223,19 +294,6 @@ func (o *Orchestrator) triggerRollbackLocked(reason string) error {
 		for _, id := range p.Devices {
 			rec := o.st.Devices[id]
 			switch rec.Phase {
-			case PhaseUpgraded:
-				rec.RollbackAttempt = 1
-				task := Task{
-					ID:      taskID(o.st.RolloutID, rec.Batch, id, TaskRollback, rec.RollbackAttempt),
-					Kind:    TaskRollback,
-					Device:  id,
-					Batch:   rec.Batch,
-					Attempt: rec.RollbackAttempt,
-				}
-				rec.Phase = PhaseRollbackInflight
-				rec.CurrentTask = task.ID
-				rec.UpdatedAt = timeNow()
-				o.dispatchLocked(task)
 			case PhasePending:
 				// 还没开始升级的设备无需回滚，标记安全终态。
 				rec.Phase = PhaseDone
@@ -247,7 +305,12 @@ func (o *Orchestrator) triggerRollbackLocked(reason string) error {
 			}
 		}
 	}
-	return o.persistLocked()
+	if err := o.persistLocked(); err != nil {
+		return err
+	}
+	// 按配额放行第一批回滚任务，其余 upgraded 设备排队等待。
+	o.pumpRollbackQueueLocked()
+	return nil
 }
 
 // markAbortedLocked 在回滚无法完成（回滚失败耗尽）时将发布置为中止态。
@@ -284,26 +347,15 @@ func (o *Orchestrator) afterDeviceEventLocked(r DeviceReport) error {
 }
 
 // evaluateRollbackLocked 判断回滚波次是否结束：
-//   - 没有任何设备还在新固件（upgraded）或回滚在途 => 回滚完成；
-//   - 此时若仍有设备停在 upgraded，说明回滚投递/确认缺失，保持等待，由 tick 补偿。
+//   - 先按配额补放排队中的回滚任务；
+//   - 没有任何设备还在新固件（upgraded 排队）或回滚在途 => 回滚完成，安全中止；
+//   - 否则保持等待，由后续设备事件或 tick 继续驱动。
 func (o *Orchestrator) evaluateRollbackLocked() error {
-	upgraded, inflight := 0, 0
-	for _, rec := range o.st.Devices {
-		switch rec.Phase {
-		case PhaseUpgraded:
-			upgraded++
-		case PhaseRollbackInflight:
-			inflight++
-		}
-		// 注意：PhaseUpgradeInflight 不计入未完成。回滚波次期间，在途升级设备
-		// 失败会直接落安全终态、成功会先变 upgraded 再在此处补发回滚，
-		// 因此这里只需关心“仍在新固件上”与“回滚任务在途”两类设备。
-	}
-	if upgraded > 0 {
-		// upgraded 状态出现在回滚期（升级成功事件与回滚触发的竞态兜底）：补发回滚任务。
-		o.redispatchRollbacksLocked()
-	}
-	if inflight > 0 || upgraded > 0 {
+	o.pumpRollbackQueueLocked()
+	s := o.statsLocked()
+	o.cfg.Logger.Printf("rollback wave status: upgradeInflight=%d rollbackInflight=%d queued=%d quota=%d",
+		s.UpgradeInflight, s.RollbackInflight, s.RollbackQueued, s.Quota)
+	if s.RollbackInflight > 0 || s.RollbackQueued > 0 {
 		return nil
 	}
 	// 所有设备都已离开新固件：回滚波次完成，批次标记失败，发布中止。
@@ -316,26 +368,49 @@ func (o *Orchestrator) evaluateRollbackLocked() error {
 	return o.persistLocked()
 }
 
-// redispatchRollbacksLocked 为仍是 upgraded 的设备补发回滚任务。
-func (o *Orchestrator) redispatchRollbacksLocked() {
-	for _, rec := range o.st.Devices {
-		if rec.Phase != PhaseUpgraded {
-			continue
-		}
-		if rec.RollbackAttempt == 0 {
-			rec.RollbackAttempt = 1
-		}
-		task := Task{
-			ID:      taskID(o.st.RolloutID, rec.Batch, rec.DeviceID, TaskRollback, rec.RollbackAttempt),
-			Kind:    TaskRollback,
-			Device:  rec.DeviceID,
-			Batch:   rec.Batch,
-			Attempt: rec.RollbackAttempt,
-		}
-		rec.Phase = PhaseRollbackInflight
-		rec.CurrentTask = task.ID
-		o.dispatchLocked(task)
+// pumpRollbackQueueLocked 按“批次序 + 计划内设备序”的固定顺序，把排队中
+// （PhaseUpgraded）的设备补进回滚在途，直到升级+回滚在途总数达到回滚配额。
+// 顺序只依赖计划本身，与上报先后无关，因此排队次序可复现。
+func (o *Orchestrator) pumpRollbackQueueLocked() {
+	if o.st.Phase != RolloutRollingBack {
+		return
 	}
+	quota := o.rollbackQuotaLocked()
+	for _, spec := range o.cfg.Plan.Batches {
+		for _, id := range spec.Devices {
+			up, rb := o.inFlightAllLocked()
+			if up+rb >= quota {
+				return
+			}
+			rec := o.st.Devices[id]
+			if rec.Phase != PhaseUpgraded {
+				continue
+			}
+			o.dispatchRollbackLocked(rec, rec.RollbackAttempt+1)
+		}
+	}
+}
+
+// dispatchRollbackLocked 为单台设备下发一次回滚任务（首次或重试），
+// 目标版本为记录的升级前基线。先落盘再投递，保证重启后可按同一位点续跑。
+func (o *Orchestrator) dispatchRollbackLocked(rec *DeviceRecord, attempt int) {
+	rec.RollbackAttempt = attempt
+	task := Task{
+		ID:      taskID(o.st.RolloutID, rec.Batch, rec.DeviceID, TaskRollback, attempt),
+		Kind:    TaskRollback,
+		Device:  rec.DeviceID,
+		Batch:   rec.Batch,
+		Attempt: attempt,
+		Target:  rec.BaselineVer,
+	}
+	rec.Phase = PhaseRollbackInflight
+	rec.CurrentTask = task.ID
+	rec.UpdatedAt = timeNow()
+	up, rb := o.inFlightAllLocked()
+	o.cfg.Logger.Printf("admit rollback device=%s attempt=%d baseline=%q inFlight=%d/%d (upgrade=%d rollback=%d)",
+		rec.DeviceID, attempt, rec.BaselineVer, up+rb, o.rollbackQuotaLocked(), up, rb)
+	_ = o.persistLocked()
+	o.dispatchLocked(task)
 }
 
 // redispatchInflightLocked 在重启恢复后重放在途任务：
@@ -377,7 +452,6 @@ func (o *Orchestrator) tickLocked() {
 	if o.st.Phase == RolloutRunning {
 		o.dispatchPendingLocked()
 	} else if o.st.Phase == RolloutRollingBack {
-		o.redispatchRollbacksLocked()
 		_ = o.evaluateRollbackLocked()
 	}
 }

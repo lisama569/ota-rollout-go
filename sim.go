@@ -50,17 +50,26 @@ type SimDevice struct {
 
 	upgradeAttempts  int
 	rollbackAttempts int
+	// curVer 是设备当前实际运行的版本：升级成功后变为新版本，
+	// 回滚成功后落回基线。上报的 FromVer 以此为准。
+	curVer FirmwareVersion
 }
 
 // React 按行为脚本生成对某个任务的全部反应动作。
 // 每个 SimDevice 只由其专属的单个 goroutine 调用，尝试计数无需额外加锁。
 func (d *SimDevice) React(task Task, target FirmwareVersion) []ReportAction {
 	now := time.Now()
+	if d.curVer == "" {
+		d.curVer = d.CurrentVer
+		if d.curVer == "" {
+			d.curVer = "1.0.0"
+		}
+	}
 	base := DeviceReport{
 		DeviceID: d.ID,
 		TaskID:   task.ID,
 		Protocol: d.Protocol,
-		FromVer:  d.CurrentVer,
+		FromVer:  d.curVer,
 		ToVer:    target,
 		At:       now,
 	}
@@ -78,6 +87,7 @@ func (d *SimDevice) React(task Task, target FirmwareVersion) []ReportAction {
 		ack.Kind = ReportAcknowledge
 		ok := base
 		ok.Kind = ReportRollbackSuccess
+		d.curVer = target // 回滚成功：落回基线版本
 		return []ReportAction{{Report: ack, Delay: time.Millisecond}, {Report: ok, Delay: 2 * time.Millisecond}}
 	}
 
@@ -123,6 +133,7 @@ func (d *SimDevice) React(task Task, target FirmwareVersion) []ReportAction {
 		first, second = second, first
 	}
 	actions = append(actions, first, second)
+	d.curVer = target // 升级成功：当前版本前进到目标版本
 	for i := 0; i < d.ExtraDuplicates; i++ {
 		dup := ok
 		dup.At = time.Now()

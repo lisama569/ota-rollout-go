@@ -64,8 +64,12 @@ UpgradeInflight
   └─ RollbackSuccess（设备自发回退）─▶ Done（计入回滚率）
 ```
 
-回滚波次期间仍在途的升级设备：升级成功会立即补发回滚任务；临时失败**不再重试升级**，
-直接落 `Done`（设备从未跑到新固件，天然安全）。
+`RollbackInflight` 下另有：`RollbackFailure` 在回滚预算内重试，耗尽落
+`RollbackFailed`（需人工介入终态）；`RollbackSuccess` 版本与基线不符/缺失时
+判 `invalid`，保持在途等待重报。
+
+回滚波次期间仍在途的升级设备：升级成功会进入回滚队列按配额放行；临时失败
+**不再重试升级**，直接落 `Done`（设备从未跑到新固件，天然安全）。
 
 ## 放量规则（健康门槛）
 
@@ -88,15 +92,47 @@ UpgradeInflight
 
 | 设备状态 | 处理 |
 | --- | --- |
-| `Upgraded`（已在新固件） | 下发回滚任务；失败可重试，耗尽则整单 `Aborted` 等待人工介入 |
-| `UpgradeInflight`（在途升级） | 等终态：成功→立即回滚；失败→不再重试，留旧版 `Done` |
+| `Upgraded`（已在新固件） | 进入回滚队列，按配额逐台放行（见下） |
+| `UpgradeInflight`（在途升级） | 等终态：成功→进回滚队列；失败→不再重试，留旧版 `Done` |
 | `Pending`（尚未放量） | 直接 `Done`（从未升级，无需回滚），且永不被补下发升级 |
 | `Incompatible` / `Failed` | 终态保持，计失败 |
 
 回滚是**全发布范围**的（之前已过门批次里仍在新固件上的设备也会被回滚）。
-所有需要回滚的设备都回到旧版本后，回滚波次收敛，发布以 `Aborted` 结束——
-这是“安全的中止”，区别于 `Completed`；只有“设备卡在新固件且回滚耗尽”才是
-需要人工介入的非安全中止。
+所有需要回滚的设备都回到基线版本后，回滚波次收敛，发布以 `Aborted` 结束——
+这是“安全的中止”，区别于 `Completed`；只有“设备卡在新固件且回滚预算耗尽”
+（`RollbackFailed`）才是需要人工介入的非安全中止。
+
+### 回滚配额与排队
+
+- 回滚波次的在途配额 = 触发回滚时当前批次的 `MaxInFlight`；
+  **升级与回滚两条链路的在途总数**任何时候都不超过该配额（整体不会把设备打满）。
+- 需要回滚的设备按**批次序 + 计划内设备序**的固定顺序排队（与上报先后无关，
+  可复现）；前一台设备落回基线释放名额后，队列中的下一台才被补发。
+- `Stats()` 返回 `Quota / UpgradeInflight / RollbackInflight / RollbackQueued`
+  快照，两条链路的在途与排队情况一眼可看；日志中每次放行与每次波次评估
+  也会打印这组计数。
+- 排队（`Upgraded`）与在途（`RollbackInflight`）状态都持久化：重启后在途任务
+  以相同 TaskID 重放、队列按同一顺序继续放行；已确认回滚完成的设备不再下发、
+  不重复计数。
+
+### 回滚重试预算与人工介入
+
+- 单台设备的回滚重试预算为 `MaxRollbackAttempts`（含首次下发；`<=0` 时回落为
+  `MaxAttempts`）。预算内失败按确定性节奏重试（尝试号 +1，TaskID 确定）。
+- 预算耗尽：设备落 `RollbackFailed` 终态、发布 `Aborted`，判定分类为
+  `manual-intervention`（`ClassManual`），与 `incompatible` / `invalid` /
+  `retryable` 明确可区分，等待人工介入。
+- 已用次数持久化在 `RollbackAttempt`：重启不会抹掉预算，也不会因此多打一轮；
+  已耗尽设备在重启后不再收到任何任务。
+
+### 版本基线
+
+- 每台设备升级前自报的版本（首个携带 `FromVer` 的升级上报，首帧优先）记录为
+  回滚基线 `BaselineVer`；回滚任务的目标版本即该基线。
+- `RollbackSuccess` 只有落回版本**等于基线**才计成功；版本对不上或缺失都判
+  `invalid`（可区分原因），不消耗重试预算，设备保持在途等待重报。
+- 兼容范围：基线未知（如从旧版本状态恢复、设备上报未携带 `FromVer`）时，
+  采纳首个**非空**回报版本为基线；空版本仍然无效。
 
 ## 上报判定：唯一、可复现、可解释
 
@@ -106,12 +142,15 @@ UpgradeInflight
   - 与结论一致的重复帧 => `duplicate`（不重复计数、不重复下发）；
   - 与结论矛盾的迟到帧 => `stale`（忽略，但留痕）；
   - 属于旧尝试号的帧 => `stale`；无法识别的 TaskID => `failed-invalid`。
-- **三类失败严格可区分**（`FailureClass`）：
+- **三类失败严格可区分**（`FailureClass`），另有第四类人工介入终态：
   - `incompatible`：设备协议主版本高于计划（或设备明确报 `protocol-too-new`），
     设备不可升级，落终态，永不重试；
-  - `invalid`：缺 DeviceID/TaskID、未知上报类型、版本号畸形、目标版本与计划不符、
-    任务种类与上报种类不符等。**绝不静默丢弃**，显式判无效；不计成功，也不消耗重试次数；
-  - `retryable`：其余临时故障（如 `download-timeout`），在 `MaxAttempts` 内下发新任务重试。
+  - `invalid`：缺 DeviceID/TaskID、未知上报类型、版本号畸形、目标版本与任务目标不符、
+    回滚落回版本与基线不符/缺失、任务种类与上报种类不符等。**绝不静默丢弃**，
+    显式判无效；不计成功，也不消耗重试次数；
+  - `retryable`：其余临时故障（如 `download-timeout`），在 `MaxAttempts` 内下发新任务重试；
+  - `manual-intervention`：回滚重试预算耗尽，设备可能仍在新固件上，
+    落 `RollbackFailed` 终态并中止发布，等待人工介入。
 - **乱序**：成功帧早于 ACK 到达时直接生效，迟到 ACK 只是重复；可选的 `Seq`
   字段提供更严格的乱序保护（更小序号判 `stale`）。
 - 全部判定在单把互斥锁下完成，计数器是确定值，因此同一批上报无论以何种
@@ -136,7 +175,8 @@ UpgradeInflight
   - 已确认终态的设备**绝不再下发**；
   - 状态显示在途的任务以**相同确定性 TaskID 重投**（至少投递一次），
     设备与状态机都按 TaskID 去重，因此重复投递是幂等的；
-  - 仍在发布态时按当前批次配额继续放量；回滚态时补发缺失的回滚任务。
+  - 仍在发布态时按当前批次配额继续放量；回滚态时按回滚配额补放队列并检查收敛，
+    已用掉的回滚重试次数原样保留。
 
 ## 本地验证方法
 
@@ -151,6 +191,17 @@ go test -race -v -run TestSimE2E                           # 模拟通道端到�
 go test -race -v -run TestResume                           # 重启续跑/指纹/位点回退
 go test -race -v -run TestThreeFailureClasses              # 三类原因可区分
 go test -race -v -run TestFileStore                        # 真实文件持久化
+
+# 本轮新增的回滚加固能力：
+go test -race -v -run TestRollbackQuotaAndQueueing         # 回滚配额/排队/放行顺序
+go test -race -v -run TestRollbackResumeMidWave            # 回滚波次中途重启续跑
+go test -race -v -run TestRollbackRetryBudgetSurvivesRestart  # 重试预算跨重启保持
+go test -race -v -run TestRollbackBaseline                 # 版本基线不符/缺失/兼容
+go test -race -v -run TestConcurrentRollbackReports        # 并发回滚上报结论唯一
+
+# 本地演示（流程走完进程自行退出，不依赖外部超时）：
+go run ./cmd/otademo -state /tmp/ota-demo.json   # 熔断 -> 配额内排队回滚 -> 安全中止
+go run ./cmd/otademo -state /tmp/ota-demo.json   # 再跑：从状态文件恢复，不重复下发
 ```
 
 测试日志会打印关键输入与判定依据，例如：

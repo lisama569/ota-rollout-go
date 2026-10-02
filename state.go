@@ -19,21 +19,27 @@ const (
 	PhaseIncompatible
 	// PhaseFailed 表示可重试失败已耗尽，设备无法完成升级的终态。
 	PhaseFailed
+	// PhaseRollbackFailed 表示回滚重试预算耗尽，设备可能仍在新固件上，
+	// 需要人工介入的终态（与升级失败耗尽可区分）。
+	PhaseRollbackFailed
 )
 
 // DeviceRecord 是单台设备的持久化状态。
 type DeviceRecord struct {
-	DeviceID        DeviceID     `json:"device_id"`
-	Batch           BatchIndex   `json:"batch"`
-	Phase           DevicePhase  `json:"phase"`
-	CurrentTask     TaskID       `json:"current_task"`
-	Attempt         int          `json:"attempt"`
-	RollbackAttempt int          `json:"rollback_attempt"`
-	Success         bool         `json:"success"`
-	Class           FailureClass `json:"class"`
-	LastReason      string       `json:"last_reason"`
-	LastSeq         uint64       `json:"last_seq"`
-	UpdatedAt       time.Time    `json:"updated_at"`
+	DeviceID        DeviceID    `json:"device_id"`
+	Batch           BatchIndex  `json:"batch"`
+	Phase           DevicePhase `json:"phase"`
+	CurrentTask     TaskID      `json:"current_task"`
+	Attempt         int         `json:"attempt"`
+	RollbackAttempt int         `json:"rollback_attempt"`
+	// BaselineVer 是设备升级前自报的固件版本，即回滚必须落回的基线。
+	// 从首个携带 FromVer 的升级上报记录，之后不再改变（首帧优先）。
+	BaselineVer FirmwareVersion `json:"baseline_ver"`
+	Success     bool            `json:"success"`
+	Class       FailureClass    `json:"class"`
+	LastReason  string          `json:"last_reason"`
+	LastSeq     uint64          `json:"last_seq"`
+	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
 // BatchPhase 是批次的生命周期阶段。

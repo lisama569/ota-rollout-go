@@ -67,6 +67,8 @@ func className(c FailureClass) string {
 		return "invalid"
 	case ClassRetryable:
 		return "retryable"
+	case ClassManual:
+		return "manual-intervention"
 	default:
 		return "none"
 	}
@@ -88,6 +90,8 @@ func devicePhaseName(p DevicePhase) string {
 		return "incompatible"
 	case PhaseFailed:
 		return "failed"
+	case PhaseRollbackFailed:
+		return "rollback-failed"
 	}
 	return "unknown"
 }

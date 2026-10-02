@@ -71,13 +71,17 @@ func newTestOrchestrator(t *testing.T, p Plan) (*Orchestrator, *stubTransport, *
 	return o, tr, store
 }
 
-// upgradeFlow 构造指定设备升级尝试的上报帧。
+// oldVer 是测试中设备升级前的版本，即回滚必须落回的基线。
+const oldVer = "1.4.0"
+
+// upgradeFlow 构造指定设备升级尝试的上报帧（携带升级前版本作为回滚基线）。
 func upgradeFlow(id DeviceID, batch BatchIndex, attempt int, kind ReportKind, proto Semver) DeviceReport {
 	return DeviceReport{
 		DeviceID: id,
 		TaskID:   taskID("rl-test-001", batch, id, TaskUpgrade, attempt),
 		Kind:     kind,
 		Protocol: proto,
+		FromVer:  oldVer,
 		ToVer:    "2.0.0",
 		At:       time.Now(),
 	}
@@ -89,6 +93,8 @@ func rollbackFlow(id DeviceID, batch BatchIndex, attempt int, kind ReportKind) D
 		TaskID:   taskID("rl-test-001", batch, id, TaskRollback, attempt),
 		Kind:     kind,
 		Protocol: Semver{Major: 1},
+		FromVer:  "2.0.0",
+		ToVer:    oldVer,
 		At:       time.Now(),
 	}
 }

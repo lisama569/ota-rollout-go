@@ -91,9 +91,14 @@ func (o *Orchestrator) RecoverOrResume() error {
 	o.cfg.Logger.Printf("resumed rollout id=%s phase=%s currentBatch=%d devices=%d history=%d",
 		st.RolloutID, phaseName(st.Phase), st.CurrentBatch, len(st.Devices), len(st.History))
 	// 恢复后立即补偿：重放在途任务（相同确定性 TaskID，设备按 TaskID 去重），
-	// 若仍在发布期则按当前批次配额继续放量。
+	// 若仍在发布期则按当前批次配额继续放量；若在回滚期则按回滚配额补放队列并检查收敛。
 	o.redispatchInflightLocked()
 	o.dispatchPendingLocked()
+	if o.st.Phase == RolloutRollingBack {
+		if err := o.evaluateRollbackLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

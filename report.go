@@ -46,11 +46,24 @@ func classifyFailure(o *Orchestrator, r DeviceReport, expectedKind TaskKind) (Fa
 	if expectedKind == TaskUpgrade && r.Kind != ReportUpgradeFailure {
 		return ClassInvalid, fmt.Sprintf("upgrade task received non-upgrade failure kind %d", r.Kind)
 	}
-	// ToVer 非空时必须与计划目标一致；不一致说明上报张冠李戴，按无效处理。
-	if r.ToVer != "" && r.ToVer != plan.Target {
-		return ClassInvalid, fmt.Sprintf("report target %q mismatches plan target %q", r.ToVer, plan.Target)
+	// ToVer 非空时必须与任务目标一致；不一致说明上报张冠李戴，按无效处理。
+	// 升级任务目标是计划版本；回滚任务目标是设备记录的基线版本。
+	want := plan.Target
+	if expectedKind == TaskRollback {
+		want = targetForRollback(o, r.DeviceID)
+	}
+	if r.ToVer != "" && want != "" && r.ToVer != want {
+		return ClassInvalid, fmt.Sprintf("report target %q mismatches expected %q", r.ToVer, want)
 	}
 	return ClassRetryable, fmt.Sprintf("retryable failure: code=%s reason=%s", r.ReasonCode, r.Reason)
+}
+
+// targetForRollback 返回设备回滚任务的目标版本（记录的基线），未知时为空。
+func targetForRollback(o *Orchestrator, id DeviceID) FirmwareVersion {
+	if rec, ok := o.st.Devices[id]; ok {
+		return rec.BaselineVer
+	}
+	return ""
 }
 
 // HandleReport 处理一帧设备上报，返回该上报对应的唯一判定。
@@ -87,7 +100,11 @@ func (o *Orchestrator) decideLocked(r DeviceReport, k DecisionKind, class Failur
 // knownTaskLocked 判断 taskID 是否曾经是该设备的升级/回滚任务（用于区分
 // “旧任务的迟到帧”与“完全无法识别的无效帧”）。
 func (o *Orchestrator) knownTaskLocked(rec *DeviceRecord, id TaskID) bool {
-	for a := 0; a <= o.cfg.Plan.MaxAttempts; a++ {
+	maxAttempt := o.cfg.Plan.MaxAttempts
+	if rb := o.cfg.Plan.rollbackBudget(); rb > maxAttempt {
+		maxAttempt = rb
+	}
+	for a := 0; a <= maxAttempt; a++ {
 		if taskID(o.st.RolloutID, rec.Batch, rec.DeviceID, TaskUpgrade, a) == id {
 			return true
 		}
@@ -96,6 +113,14 @@ func (o *Orchestrator) knownTaskLocked(rec *DeviceRecord, id TaskID) bool {
 		}
 	}
 	return false
+}
+
+// recordBaselineLocked 从设备上报的 FromVer 记录回滚基线：首帧优先，之后不再改变，
+// 保证乱序/重复上报下基线唯一可复现。
+func recordBaselineLocked(rec *DeviceRecord, r DeviceReport) {
+	if rec.BaselineVer == "" && r.FromVer != "" {
+		rec.BaselineVer = r.FromVer
+	}
 }
 
 func (o *Orchestrator) handleReportLocked(r DeviceReport) (Decision, error) {
@@ -193,6 +218,7 @@ func (o *Orchestrator) handleUpgradeInflightLocked(rec *DeviceRecord, r DeviceRe
 
 	switch r.Kind {
 	case ReportAcknowledge:
+		recordBaselineLocked(rec, r)
 		rec.LastSeq = maxSeq(rec.LastSeq, r.Seq)
 		rec.UpdatedAt = timeNow()
 		d := o.decideLocked(r, DecisionAcked, ClassNone, "device acknowledged upgrade task")
@@ -201,6 +227,7 @@ func (o *Orchestrator) handleUpgradeInflightLocked(rec *DeviceRecord, r DeviceRe
 
 	case ReportUpgradeSuccess:
 		// 即便成功帧早于 ACK（乱序），终态也直接生效，ACK 之后到来只会是重复。
+		recordBaselineLocked(rec, r)
 		rec.Phase = PhaseUpgraded
 		rec.Success = true
 		rec.CurrentTask = ""
@@ -210,10 +237,10 @@ func (o *Orchestrator) handleUpgradeInflightLocked(rec *DeviceRecord, r DeviceRe
 		rec.UpdatedAt = timeNow()
 		d := o.decideLocked(r, DecisionSucceeded, ClassNone,
 			"device confirmed running target firmware")
-		// 回滚波次期间升级才成功：设备已到新固件，必须立即补发回滚任务，
-		// 不能停在 upgraded 无人处理。
+		// 回滚波次期间升级才成功：设备已到新固件，进入回滚队列，
+		// 由 pump 按配额放行，不能停在 upgraded 无人处理。
 		if o.st.Phase == RolloutRollingBack {
-			o.redispatchRollbacksLocked()
+			o.pumpRollbackQueueLocked()
 		}
 		if err := o.afterDeviceEventLocked(r); err != nil {
 			return d, err
@@ -336,10 +363,28 @@ func (o *Orchestrator) handleRollbackInflightLocked(rec *DeviceRecord, r DeviceR
 		return d, nil
 
 	case ReportRollbackSuccess:
+		// 基线校验：回滚结果必须落在记录的升级前版本上。
+		if r.ToVer == "" {
+			d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid,
+				"rollback success report missing landed version; cannot confirm baseline, awaiting re-report")
+			_ = o.persistLocked()
+			return d, nil
+		}
+		if rec.BaselineVer == "" {
+			// 兼容范围：基线未知（如从旧版本状态恢复）时，采纳首个非空回报版本为基线。
+			rec.BaselineVer = r.ToVer
+		}
+		if r.ToVer != rec.BaselineVer {
+			d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid,
+				fmt.Sprintf("rollback landed on %q but recorded baseline is %q; not counted, awaiting re-report",
+					r.ToVer, rec.BaselineVer))
+			_ = o.persistLocked()
+			return d, nil
+		}
 		rec.Phase = PhaseDone
 		rec.CurrentTask = ""
 		rec.Success = false
-		rec.LastReason = "rollback success: device restored to previous firmware"
+		rec.LastReason = fmt.Sprintf("rollback success: device restored to baseline %s", rec.BaselineVer)
 		rec.UpdatedAt = timeNow()
 		d := o.decideLocked(r, DecisionRollbackSucceeded, ClassNone, rec.LastReason)
 		if err := o.afterDeviceEventLocked(r); err != nil {
@@ -360,33 +405,27 @@ func (o *Orchestrator) handleRollbackInflightLocked(rec *DeviceRecord, r DeviceR
 			return d, nil
 		}
 		used := rec.RollbackAttempt
+		budget := o.cfg.Plan.rollbackBudget()
 		rec.LastReason = why
-		if used >= o.cfg.Plan.MaxAttempts {
-			// 回滚失败耗尽：设备可能仍运行新版本，发布只能中止，等待人工介入。
+		if used >= budget {
+			// 回滚重试预算耗尽：设备可能仍在新固件上，落“需人工介入”终态，
+			// 原因与其他失败明确可区分；发布中止。重启不得抹掉已用次数、也不再补发。
+			rec.Phase = PhaseRollbackFailed
 			rec.CurrentTask = ""
-			rec.Class = ClassRetryable
-			d := o.decideLocked(r, DecisionRollbackFailed, ClassRetryable,
-				fmt.Sprintf("%s; rollback attempts exhausted at %d, manual intervention required",
-					why, used))
-			o.markAbortedLocked("rollback attempts exhausted for device " + string(rec.DeviceID))
+			rec.Class = ClassManual
+			rec.UpdatedAt = timeNow()
+			d := o.decideLocked(r, DecisionRollbackFailed, ClassManual,
+				fmt.Sprintf("%s; rollback budget exhausted at %d/%d, manual intervention required",
+					why, used, budget))
+			o.markAbortedLocked("rollback budget exhausted for device " + string(rec.DeviceID) +
+				": manual intervention required")
 			return d, o.persistLocked()
 		}
+		// 预算内：按确定性节奏（尝试号 +1，TaskID 确定）重新下发回滚任务。
 		next := used + 1
-		rec.RollbackAttempt = next
-		task := Task{
-			ID:      taskID(o.st.RolloutID, rec.Batch, rec.DeviceID, TaskRollback, next),
-			Kind:    TaskRollback,
-			Device:  rec.DeviceID,
-			Batch:   rec.Batch,
-			Attempt: next,
-		}
-		rec.CurrentTask = task.ID
 		d := o.decideLocked(r, DecisionRetried, ClassRetryable,
-			fmt.Sprintf("%s; dispatch rollback retry %d/%d", why, next, o.cfg.Plan.MaxAttempts))
-		if err := o.persistLocked(); err != nil {
-			return d, err
-		}
-		o.dispatchLocked(task)
+			fmt.Sprintf("%s; dispatch rollback retry %d/%d", why, next, budget))
+		o.dispatchRollbackLocked(rec, next)
 		return d, nil
 
 	default:
