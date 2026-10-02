@@ -16,10 +16,13 @@ go test -race -v ./...
 # 多次重复，确认结论稳定可复现
 go test -race -count=10 ./...
 
-# 跑本地演示：两批次放量 -> 一台设备协议不兼容 -> 熔断 -> 已升级设备回滚 -> 安全中止
+# 跑本地演示：配额1 下受控回滚——排队、固定节奏重试（2 次失败后成功）、
+# 版本基线核验，流程走完进程自行退出（不靠外部超时兜底）。
 go run ./cmd/otademo -state ./ota-demo-state.json
-# 再跑一次：从同一个状态文件恢复，不重复下发任何任务
+# 再跑一次：从同一个状态文件恢复，已中止态不再下发任何任务，立即退出
 go run ./cmd/otademo -state ./ota-demo-state.json
+# 想重新演练：删掉状态文件即可
+rm -f ./ota-demo-state.json
 ```
 
 ## 目录结构
@@ -29,20 +32,22 @@ go run ./cmd/otademo -state ./ota-demo-state.json
 | `types.go` | 计划、上报、任务、判定等核心值类型 |
 | `state.go` | 发布/批次/设备状态机、计划指纹、深拷贝、审计历史 |
 | `report.go` | 上报结构校验、失败三分类、`HandleReport` 全部判定分支 |
-| `engine.go` | 配额调度、健康门槛、批次推进、回滚波次、重启补偿、`Run` 循环 |
+| `engine.go` | 配额调度、健康门槛、批次推进、回滚队列/配额泵/定时重试、重启补偿、`Run` 循环 |
 | `orchestrator.go` | 编排器装配、持久化、`RecoverOrResume` 与位点回退校验 |
 | `storage.go` | `FileStore`（临时文件 + 原子 rename）与 `MemoryStore`（测试/重启模拟） |
-| `sim.go` | 本地模拟设备行为脚本与内存传输通道（确定性延迟、乱序、重复、畸形帧） |
-| `cmd/otademo` | 本地可运行的端到端演示 |
+| `sim.go` | 本地模拟设备行为脚本与内存传输通道（确定性延迟、乱序、重复、畸形帧、回滚版本/重试） |
+| `rollback_quota_test.go` / `rollback_resume_test.go` / `rollback_baseline_test.go` | 回滚限流排队、回滚期重启续跑与预算持久化、版本基线与并发唯一性 |
+| `cmd/otademo` | 本地可运行的端到端演示（受控回滚，流程走完自行退出） |
 
 ## 发布状态机
 
 ### 整批发布（RolloutPhase）
 
 ```
-Running ──门槛超阈值/批次耗尽未达标──▶ RollingBack ──所有新固件设备回退完毕──▶ Aborted
+Running ──门槛超阈值/批次耗尽未达标──▶ RollingBack ──所有新固件设备回到基线──▶ Aborted（安全中止）
    │                                      │
-   │                                      └─回滚失败耗尽（设备卡在新固件）──▶ Aborted（需人工介入）
+   │                                      └─某设备回滚重试预算耗尽（设备可能仍在新固件）
+   │                                         ──▶ Aborted（人工介入，立即冻结，不再推进队列）
    └────────全部批次过门──────────────────────────────────────────────────▶ Completed
 ```
 
@@ -53,10 +58,19 @@ Pending
   │ 配额允许，下发升级任务 a1
   ▼
 UpgradeInflight
-  ├─ ACK（可乱序，不改变终态）
-  ├─ UpgradeSuccess ───────────────▶ Upgraded ──收到回滚任务──▶ RollbackInflight
-  │                                                                  ├─ RollbackSuccess ─▶ Done
-  │                                                                  └─ RollbackFailure×N（耗尽）▶ 触发 Aborted
+  ├─ ACK / 任一有效帧：记录 FromVer 作为回滚基线（一次性，之后不可改写）
+  ├─ UpgradeSuccess ──▶ Upgraded ──回滚触发，入队──▶ RollbackQueued
+  │                                                  │ 配额有空位，按队列顺序放行
+  │                                                  ▼
+  │                                              RollbackInflight
+  │                                                  ├─ RollbackSuccess(ToVer==基线) ─▶ Done(restored)
+  │                                                  ├─ RollbackSuccess(缺版本/版本≠基线) ─▶ invalid，
+  │                                                  │     保持在途等重报，不消耗重试预算
+  │                                                  ├─ RollbackFailure（预算内）─▶ RollbackWaiting
+  │                                                  │     按固定节奏到点原地重投（名额保留）
+  │                                                  └─ RollbackFailure（预算耗尽）
+  │                                                        ─▶ RollbackFailed（人工介入终态，
+  │                                                            class=rollback-budget-exhausted）
   ├─ UpgradeFailure(incompatible) ─▶ Incompatible（终态，永不重试，计失败）
   ├─ UpgradeFailure(retryable) ─────▶ 未耗尽：下发 a2...，仍在 UpgradeInflight
   │                                  已耗尽：Failed（终态，计失败）
@@ -64,7 +78,7 @@ UpgradeInflight
   └─ RollbackSuccess（设备自发回退）─▶ Done（计入回滚率）
 ```
 
-回滚波次期间仍在途的升级设备：升级成功会立即补发回滚任务；临时失败**不再重试升级**，
+回滚波次期间仍在途的升级设备：升级成功会立即进入回滚队列；临时失败**不再重试升级**，
 直接落 `Done`（设备从未跑到新固件，天然安全）。
 
 ## 放量规则（健康门槛）
@@ -82,21 +96,62 @@ UpgradeInflight
 4. 批次全部设备终态后复核：`upgraded==0` 或任一比率超阈值 => 回滚；
    否则批次 `Passed`，推进下一批。最后一批通过 => `Completed`。
 
-## 回滚规则
+## 回滚规则（受控、可恢复、可解释）
 
 触发回滚时按设备当前状态分别处理：
 
 | 设备状态 | 处理 |
 | --- | --- |
-| `Upgraded`（已在新固件） | 下发回滚任务；失败可重试，耗尽则整单 `Aborted` 等待人工介入 |
-| `UpgradeInflight`（在途升级） | 等终态：成功→立即回滚；失败→不再重试，留旧版 `Done` |
+| `Upgraded`（已在新固件） | 进入回滚队列，在当前批次配额内逐台放行；失败按预算与固定节奏重试 |
+| `UpgradeInflight`（在途升级） | 等终态：成功→进回滚队列；失败→不重试升级，留旧版 `Done` |
 | `Pending`（尚未放量） | 直接 `Done`（从未升级，无需回滚），且永不被补下发升级 |
 | `Incompatible` / `Failed` | 终态保持，计失败 |
 
 回滚是**全发布范围**的（之前已过门批次里仍在新固件上的设备也会被回滚）。
-所有需要回滚的设备都回到旧版本后，回滚波次收敛，发布以 `Aborted` 结束——
-这是“安全的中止”，区别于 `Completed`；只有“设备卡在新固件且回滚耗尽”才是
-需要人工介入的非安全中止。
+
+### 配额与排队（升级 / 回滚共享在途预算）
+
+- 回滚**不单独开闸**：同一时刻，“当前批次仍在途的升级任务” + “回滚在途任务”
+  + “回滚失败后等待定时重试的设备”总数严格不超过**当前批次的 `MaxInFlight`**。
+  两条链路的在途情况可通过 `RolloutStatus()` 一眼看明白（`Queued / Inflight /
+  Waiting / Restored / Manual`），整体不会把设备打满。
+- 等待重试的设备**保留它自己的名额**：重试窗口内队列后续设备不会顶上来，
+  队列顺序与“谁占名额”都稳定可解释。
+- 排队顺序**固定、可复现**：严格按（批次序号, 批次内名单位置）排序，
+  与上报到达顺序无关。队首设备回到基线释放名额后，下一台才被补入。
+- 回滚队列（`RolloutQueue`）随状态持久化：重启后队列、在途、等待重试状态
+  原样恢复；已确认回滚完成的设备不在队列、不会被重复下发或重复计数。
+
+### 重试预算与人工介入
+
+- 回滚使用**独立**于升级的重试预算 `MaxRollbackAttempts`（为 0 时回退用
+  `MaxAttempts`）。每台设备的已用尝试次数持久化在设备记录上。
+- 预算内失败后**不立即重发**：按固定节奏 `RollbackRetryInterval`
+  （默认 100ms）排定 `NextAttemptAt` 并持久化，设备进入 `RollbackWaiting`，
+  由补偿 tick 到点以**相同确定性 TaskID** 原地重投。重启不会抹掉已用次数，
+  未到点绝不提前重投，因此不会多打一轮；重复/迟到的失败帧只得到
+  `duplicate/stale`，不会重复扣预算。
+- 预算耗尽：设备进入明确终态 `RollbackFailed`，失败类别是可区分的
+  `rollback-budget-exhausted`；编排器**立即冻结**（停止推进队列后续设备、
+  不再下发），发布 `Aborted`，审计决策写明“MANUAL INTERVENTION REQUIRED”。
+- 所有需要回滚的设备都确认回到基线后，回滚波次安全收敛、发布以 `Aborted`
+  结束——这是“安全的中止”，区别于 `Completed`；只有“预算耗尽、设备可能仍
+  停在新固件”才是需要人工介入的非安全中止。
+
+### 版本基线（回滚结果必须落回升级前版本）
+
+- 每台设备升级前运行的版本作为**回滚基线**：从它对升级任务的首帧非空
+  `FromVer` 记录（ACK、成功、失败帧都可贡献），一旦记录不再改变。下发的
+  回滚任务 `Target` 即该基线。
+- 回滚成功帧必须携带落地版本 `ToVer` 且**等于记录的基线**才算成功：
+  - 设备报回一个对不上的版本，或干脆没说版本 → 判定 `failed-invalid`
+    （原因字符串区分“版本不符 / 缺版本 / 无基线可核验”），**不计成功、不
+    消耗重试预算**，设备保持回滚在途，等待设备重报；
+  - 只有 `ToVer == Baseline` 才落 `Done(restored)`，并据此释放名额、补位队列。
+- 兼容范围：基线是**逐设备**记录的字符串版本，允许同批次设备升级前版本
+  不同；每台设备只与**自己的**基线比对。设备在未被编排器要求回滚时的
+  自发回退（升级窗口内的 rollback-success）仍按原语义直接计入回滚率，
+  不做基线校验（那时没有对应的编排器回滚任务）。
 
 ## 上报判定：唯一、可复现、可解释
 
@@ -136,7 +191,11 @@ UpgradeInflight
   - 已确认终态的设备**绝不再下发**；
   - 状态显示在途的任务以**相同确定性 TaskID 重投**（至少投递一次），
     设备与状态机都按 TaskID 去重，因此重复投递是幂等的；
-  - 仍在发布态时按当前批次配额继续放量；回滚态时补发缺失的回滚任务。
+  - 仍在发布态时按当前批次配额继续放量；
+  - 回滚态时先**对账回滚队列**（剔除已离队设备、补入仍停在新固件的设备、
+    按全局名次重排），再由配额泵续跑；
+  - `RollbackWaiting` 的设备必须等到持久化的 `NextAttemptAt` 才重投，
+    重启既不会抹掉已用回滚预算，也不会提前多打一轮。
 
 ## 本地验证方法
 
@@ -151,16 +210,28 @@ go test -race -v -run TestSimE2E                           # 模拟通道端到�
 go test -race -v -run TestResume                           # 重启续跑/指纹/位点回退
 go test -race -v -run TestThreeFailureClasses              # 三类原因可区分
 go test -race -v -run TestFileStore                        # 真实文件持久化
+
+# 回滚加固相关场景：
+go test -race -v -run TestRollbackQuotaAndQueueOrder       # 回滚限流、固定顺序排队、逐台补位
+go test -race -v -run TestSharedQuotaUpgradeAndRollback    # 升级/回滚共享在途配额
+go test -race -v -run TestResumeRollback                   # 回滚期重启：队列/在途/定时重试续跑
+go test -race -v -run TestRollbackFailureExhaustsAborts    # 固定节奏重试 + 预算耗尽人工终态
+go test -race -v -run TestRollbackVersionMismatchIsInvalid # 回滚落地版本与基线对不上判无效
+go test -race -v -run TestRollbackSuccessWithoutBaselineRecorded  # 没说版本/无基线不算成功
+go test -race -v -run TestConcurrentRollbackReportsUnique  # 并发成功/错版/重复，结论唯一
+go test -race -v -run TestRollbackFailureDuplicatesCountedOnce    # 重复失败帧只扣一次预算
 ```
 
 测试日志会打印关键输入与判定依据，例如：
 
 ```
-decision device=s3 task=...a1 kind=failed-incompatible report=upgrade-failure
-  class=incompatible reason="device protocol v2.0.0 newer than plan v1.0.0: ..."
-gate batch=0 total=4 evaluated=2 upgraded=1 rolledback=0 failed=1 inflight=1
-  failRate=50.0% rbRate=0.0% (limits 25.0%/25.0%, minN=2) trigger=s3
-ROLLBACK TRIGGERED batch=0 reason="health gate violated at evaluated=2: ..."
+baseline captured device=s1 baseline=1.0.0
+rollback enqueue device=s1 batch=0 queuePos=1 baseline=1.0.0
+rollback pump admitted=1 occupied=1/1 queued=1
+decision ... kind=retried class=retryable reason="...; rollback retry 2/3 scheduled at 05:10:53.394 (fixed cadence)"
+rollback redrive device=s1 attempt=2 (scheduled at 05:10:53.394)
+decision ... kind=failed-invalid class=invalid reason="rollback landing version \"1.5.0\" does not match recorded baseline \"1.0.0\""
+rollback gate upgraded=0 queued=0 inflight=0 waiting=0 restored=2 manual=0 statusQ=[]
 ```
 
 ## 设计取舍

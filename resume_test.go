@@ -98,6 +98,16 @@ func TestResumeRollbackWave(t *testing.T) {
 	if tasks[0].ID != taskID("rl-test-001", 0, "d1", TaskRollback, 1) {
 		t.Fatalf("rollback task id changed across restart: %s", tasks[0].ID)
 	}
+	// 熔断时 d3 的升级任务仍在途（未决）：回滚波次必须等它终态，不能提前中止。
+	// d3 临时失败 => 回滚期不重试升级，直接安全终态并释放名额。
+	f3 := upgradeFlow("d3", 0, 1, ReportUpgradeFailure, protoV1)
+	f3.ReasonCode = "download-timeout"
+	if d, _ := o2.HandleReport(f3); d.Kind != DecisionFailedRetryable {
+		t.Fatalf("d3 in-flight upgrade fails during rollback: %v", d.Kind)
+	}
+	if st := o2.State(); st.Devices["d3"].Phase != PhaseDone {
+		t.Fatalf("d3 phase=%v, want done without upgrade retry", st.Devices["d3"].Phase)
+	}
 	if d, err := o2.HandleReport(rollbackFlow("d1", 0, 1, ReportRollbackSuccess)); err != nil || d.Kind != DecisionRollbackSucceeded {
 		t.Fatalf("rollback after resume: %v %v", d.Kind, err)
 	}

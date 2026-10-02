@@ -67,6 +67,8 @@ func className(c FailureClass) string {
 		return "invalid"
 	case ClassRetryable:
 		return "retryable"
+	case ClassRollbackBudgetExhausted:
+		return "rollback-budget-exhausted"
 	default:
 		return "none"
 	}
@@ -80,14 +82,20 @@ func devicePhaseName(p DevicePhase) string {
 		return "upgrade-inflight"
 	case PhaseUpgraded:
 		return "upgraded"
+	case PhaseRollbackQueued:
+		return "rollback-queued"
 	case PhaseRollbackInflight:
 		return "rollback-inflight"
+	case PhaseRollbackWaiting:
+		return "rollback-waiting"
 	case PhaseDone:
 		return "done"
 	case PhaseIncompatible:
 		return "incompatible"
 	case PhaseFailed:
 		return "failed"
+	case PhaseRollbackFailed:
+		return "rollback-failed(manual)"
 	}
 	return "unknown"
 }

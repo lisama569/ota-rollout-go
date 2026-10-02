@@ -92,8 +92,12 @@ func (o *Orchestrator) RecoverOrResume() error {
 		st.RolloutID, phaseName(st.Phase), st.CurrentBatch, len(st.Devices), len(st.History))
 	// 恢复后立即补偿：重放在途任务（相同确定性 TaskID，设备按 TaskID 去重），
 	// 若仍在发布期则按当前批次配额继续放量。
+	o.normalizeRollbackLocked()
 	o.redispatchInflightLocked()
 	o.dispatchPendingLocked()
+	if o.st.Phase == RolloutRollingBack {
+		o.pumpRollbacksLocked()
+	}
 	return nil
 }
 

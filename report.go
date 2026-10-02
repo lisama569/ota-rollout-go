@@ -1,6 +1,9 @@
 package ota
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // validateReport 对原始上报做结构性校验，返回 Invalid 类原因。
 // 校验只针对“报文本身”，不依赖设备当前状态。
@@ -47,7 +50,9 @@ func classifyFailure(o *Orchestrator, r DeviceReport, expectedKind TaskKind) (Fa
 		return ClassInvalid, fmt.Sprintf("upgrade task received non-upgrade failure kind %d", r.Kind)
 	}
 	// ToVer 非空时必须与计划目标一致；不一致说明上报张冠李戴，按无效处理。
-	if r.ToVer != "" && r.ToVer != plan.Target {
+	// 该约束只针对升级任务：回滚任务的 ToVer/目标是设备自己的版本基线，
+	// 与计划目标不同，回滚的版本正确性在回滚成功时按基线单独核验。
+	if expectedKind == TaskUpgrade && r.ToVer != "" && r.ToVer != plan.Target {
 		return ClassInvalid, fmt.Sprintf("report target %q mismatches plan target %q", r.ToVer, plan.Target)
 	}
 	return ClassRetryable, fmt.Sprintf("retryable failure: code=%s reason=%s", r.ReasonCode, r.Reason)
@@ -135,13 +140,39 @@ func (o *Orchestrator) handleReportLocked(r DeviceReport) (Decision, error) {
 		return o.handleUpgradeInflightLocked(rec, r)
 	case PhaseRollbackInflight:
 		return o.handleRollbackInflightLocked(rec, r)
+	case PhaseRollbackQueued:
+		// 设备在回滚队列中、尚未收到任何回滚任务：只可能收到旧升级任务的迟到帧。
+		if o.knownTaskLocked(rec, r.TaskID) {
+			d := o.duplicateOrStaleLocked(rec, r)
+			return d, nil
+		}
+		d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid,
+			"report while device is queued for rollback and has no rollback task yet")
+		return d, nil
+	case PhaseRollbackWaiting:
+		// 定时重试窗口内：当前（已失败）任务的任何迟到帧一律视为重复/陈旧，
+		// 失败结论已经生效，绝不能再触发一次重试或多扣一次预算；
+		// 未来尝试号或未知任务的帧也不改状态——重试节奏由编排器掌握，设备不能抢跑。
+		if r.TaskID == rec.CurrentTask {
+			d := o.duplicateOrStaleLocked(rec, r)
+			return d, nil
+		}
+		if o.knownTaskLocked(rec, r.TaskID) {
+			d := o.decideLocked(r, DecisionStale, ClassNone,
+				"report during rollback retry wait; attempt not dispatched yet")
+			d.Batch = rec.Batch
+			return d, nil
+		}
+		d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid,
+			"report with unknown task id during rollback retry wait")
+		return d, nil
 	case PhasePending:
 		d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid,
 			"report while device has no in-flight task (pending)")
 		_ = o.persistLocked()
 		return d, nil
 	default:
-		// 设备已终态（done/incompatible/failed）或已升级（PhaseUpgraded）：
+		// 设备已终态（done/incompatible/failed/rollback-failed）或已升级（PhaseUpgraded）：
 		// 只接受已知旧任务的重复/迟到帧。
 		if o.knownTaskLocked(rec, r.TaskID) {
 			return o.duplicateOrStaleLocked(rec, r), nil
@@ -157,15 +188,25 @@ func (o *Orchestrator) handleReportLocked(r DeviceReport) (Decision, error) {
 func (o *Orchestrator) duplicateOrStaleLocked(rec *DeviceRecord, r DeviceReport) Decision {
 	var consistent bool
 	switch {
+	case rec.Phase == PhaseDone && rec.Restored:
+		// 经编排器回滚确认回到基线：回滚成功帧（含落地版本）为一致。
+		consistent = r.Kind == ReportRollbackSuccess
 	case rec.Phase == PhaseDone && rec.Success:
 		// 正常完成：回滚成功帧也可能是设备自发回滚后的重复，这里只认升级成功帧为一致。
 		consistent = r.Kind == ReportUpgradeSuccess
+	case rec.Phase == PhaseDone:
+		// 其余安全终态（从未升级/回滚期升级失败/自发回退）：失败或回滚成功帧都可一致。
+		consistent = r.Kind == ReportUpgradeFailure || r.Kind == ReportRollbackSuccess
 	case rec.Phase == PhaseIncompatible:
 		consistent = r.Kind == ReportUpgradeFailure
 	case rec.Phase == PhaseFailed:
 		consistent = r.Kind == ReportUpgradeFailure
+	case rec.Phase == PhaseRollbackFailed:
+		consistent = r.Kind == ReportRollbackFailure
 	case rec.Phase == PhaseUpgraded:
 		consistent = r.Kind == ReportUpgradeSuccess || r.Kind == ReportAcknowledge
+	case rec.Phase == PhaseRollbackWaiting:
+		consistent = r.Kind == ReportRollbackFailure
 	}
 	k := DecisionStale
 	why := "late contradicting report for an already resolved task"
@@ -190,10 +231,14 @@ func (o *Orchestrator) handleUpgradeInflightLocked(rec *DeviceRecord, r DeviceRe
 			"report task id does not match current in-flight task "+string(rec.CurrentTask))
 		return d, nil
 	}
+	// 任何对当前升级任务的有效帧都可以贡献基线：设备尚未跑上新固件时，
+	// FromVer 就是它升级前的真实版本；只记录首个非空值，之后不可改写。
+	o.captureBaselineLocked(rec, r.FromVer)
 
 	switch r.Kind {
 	case ReportAcknowledge:
 		rec.LastSeq = maxSeq(rec.LastSeq, r.Seq)
+		o.captureBaselineLocked(rec, r.FromVer)
 		rec.UpdatedAt = timeNow()
 		d := o.decideLocked(r, DecisionAcked, ClassNone, "device acknowledged upgrade task")
 		_ = o.persistLocked()
@@ -201,6 +246,7 @@ func (o *Orchestrator) handleUpgradeInflightLocked(rec *DeviceRecord, r DeviceRe
 
 	case ReportUpgradeSuccess:
 		// 即便成功帧早于 ACK（乱序），终态也直接生效，ACK 之后到来只会是重复。
+		o.captureBaselineLocked(rec, r.FromVer)
 		rec.Phase = PhaseUpgraded
 		rec.Success = true
 		rec.CurrentTask = ""
@@ -210,10 +256,10 @@ func (o *Orchestrator) handleUpgradeInflightLocked(rec *DeviceRecord, r DeviceRe
 		rec.UpdatedAt = timeNow()
 		d := o.decideLocked(r, DecisionSucceeded, ClassNone,
 			"device confirmed running target firmware")
-		// 回滚波次期间升级才成功：设备已到新固件，必须立即补发回滚任务，
+		// 回滚波次期间升级才成功：设备已到新固件，立即入回滚队列，由配额泵放行，
 		// 不能停在 upgraded 无人处理。
 		if o.st.Phase == RolloutRollingBack {
-			o.redispatchRollbacksLocked()
+			o.pumpRollbacksLocked()
 		}
 		if err := o.afterDeviceEventLocked(r); err != nil {
 			return d, err
@@ -336,10 +382,42 @@ func (o *Orchestrator) handleRollbackInflightLocked(rec *DeviceRecord, r DeviceR
 		return d, nil
 
 	case ReportRollbackSuccess:
+		// 版本基线校验：设备必须明确报回它落地的版本（ToVer），且必须等于
+		// 升级前记录的基线。缺版本 / 版本对不上都不算成功：判无效、不消耗重试
+		// 预算，设备保持回滚在途，等待设备重报（或重发后的新帧）。
+		baseline := rec.Baseline
+		if baseline == "" {
+			why := "rollback success without a recorded version baseline: cannot verify the restored firmware"
+			rec.Class = ClassInvalid
+			rec.LastReason = why
+			d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid, why)
+			_ = o.persistLocked()
+			return d, nil
+		}
+		if r.ToVer == "" {
+			why := fmt.Sprintf("rollback success without landing version: expected baseline %s, device reported no version", baseline)
+			rec.Class = ClassInvalid
+			rec.LastReason = why
+			d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid, why)
+			_ = o.persistLocked()
+			return d, nil
+		}
+		if r.ToVer != baseline {
+			why := fmt.Sprintf("rollback landing version %q does not match recorded baseline %q", r.ToVer, baseline)
+			rec.Class = ClassInvalid
+			rec.LastReason = why
+			d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid, why)
+			_ = o.persistLocked()
+			return d, nil
+		}
 		rec.Phase = PhaseDone
 		rec.CurrentTask = ""
 		rec.Success = false
-		rec.LastReason = "rollback success: device restored to previous firmware"
+		rec.Restored = true
+		rec.Class = ClassNone
+		rec.NextAttemptAt = time.Time{}
+		rec.LastReason = fmt.Sprintf("rollback success: device restored to baseline %s", baseline)
+		rec.LastSeq = maxSeq(rec.LastSeq, r.Seq)
 		rec.UpdatedAt = timeNow()
 		d := o.decideLocked(r, DecisionRollbackSucceeded, ClassNone, rec.LastReason)
 		if err := o.afterDeviceEventLocked(r); err != nil {
@@ -355,39 +433,52 @@ func (o *Orchestrator) handleRollbackInflightLocked(rec *DeviceRecord, r DeviceR
 			why = "retryable rollback failure: " + r.Reason
 		}
 		if class == ClassInvalid {
+			// 无效失败帧：不计成功、不消耗回滚预算，任务保持在途，等待有效重报。
+			rec.Class = ClassInvalid
+			rec.LastReason = why
 			d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid, why)
 			_ = o.persistLocked()
 			return d, nil
 		}
+		budget := o.rollbackBudgetLocked()
 		used := rec.RollbackAttempt
 		rec.LastReason = why
-		if used >= o.cfg.Plan.MaxAttempts {
-			// 回滚失败耗尽：设备可能仍运行新版本，发布只能中止，等待人工介入。
+		rec.LastSeq = maxSeq(rec.LastSeq, r.Seq)
+		if used >= budget {
+			// 回滚重试预算耗尽：停止一切重试，设备进入明确的人工介入终态，
+			// 原因类别与其它失败可区分；发布立即冻结，不再推进队列后续设备。
+			rec.Phase = PhaseRollbackFailed
 			rec.CurrentTask = ""
-			rec.Class = ClassRetryable
-			d := o.decideLocked(r, DecisionRollbackFailed, ClassRetryable,
-				fmt.Sprintf("%s; rollback attempts exhausted at %d, manual intervention required",
-					why, used))
-			o.markAbortedLocked("rollback attempts exhausted for device " + string(rec.DeviceID))
+			rec.Class = ClassRollbackBudgetExhausted
+			rec.NextAttemptAt = time.Time{}
+			rec.UpdatedAt = timeNow()
+			d := o.decideLocked(r, DecisionRollbackFailed, ClassRollbackBudgetExhausted,
+				fmt.Sprintf("%s; rollback retry budget exhausted after %d/%d attempts, manual intervention required",
+					why, used, budget))
+			o.markAbortedLocked(fmt.Sprintf(
+				"rollback retry budget exhausted for device %s after %d/%d attempts",
+				rec.DeviceID, used, budget), true)
 			return d, o.persistLocked()
 		}
+		// 预算内：不立刻重发，按固定、可复现的节奏排定下一次尝试。
+		// 尝试号与下次尝试时刻都持久化：重启不会抹掉已用预算，也不会提前多打一轮。
 		next := used + 1
+		nextAt := timeNow().Add(o.rollbackIntervalLocked())
 		rec.RollbackAttempt = next
-		task := Task{
-			ID:      taskID(o.st.RolloutID, rec.Batch, rec.DeviceID, TaskRollback, next),
-			Kind:    TaskRollback,
-			Device:  rec.DeviceID,
-			Batch:   rec.Batch,
-			Attempt: next,
-		}
-		rec.CurrentTask = task.ID
+		rec.CurrentTask = taskID(o.st.RolloutID, rec.Batch, rec.DeviceID, TaskRollback, used)
+		rec.Phase = PhaseRollbackWaiting
+		rec.NextAttemptAt = nextAt
+		rec.UpdatedAt = timeNow()
 		d := o.decideLocked(r, DecisionRetried, ClassRetryable,
-			fmt.Sprintf("%s; dispatch rollback retry %d/%d", why, next, o.cfg.Plan.MaxAttempts))
+			fmt.Sprintf("%s; rollback retry %d/%d scheduled at %s (fixed cadence)",
+				why, next, budget, nextAt.Format("15:04:05.000")))
 		if err := o.persistLocked(); err != nil {
 			return d, err
 		}
-		o.dispatchLocked(task)
-		return d, nil
+		// 设备释放了在途槽位但保留回滚名额：立刻尝试把队列下一台补入，
+		// 本设备的定时重投由 tick 到点执行。
+		o.pumpRollbacksLocked()
+		return d, o.persistLocked()
 
 	default:
 		d := o.decideLocked(r, DecisionFailedInvalid, ClassInvalid,
@@ -402,4 +493,13 @@ func maxSeq(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+// captureBaselineLocked 从设备对升级任务上报的 FromVer 中一次性记录回滚基线：
+// 只记录首个非空值，之后任何上报都不能改写（保证回滚目标可复现、不被设备随口改掉）。
+func (o *Orchestrator) captureBaselineLocked(rec *DeviceRecord, from FirmwareVersion) {
+	if rec.Baseline == "" && from != "" {
+		rec.Baseline = from
+		o.cfg.Logger.Printf("baseline captured device=%s baseline=%s", rec.DeviceID, from)
+	}
 }

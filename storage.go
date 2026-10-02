@@ -136,5 +136,13 @@ func (st *RolloutState) validate() error {
 			return ErrInvalidState
 		}
 	}
+	// 回滚队列中的每个设备必须存在、且确实停在排队态；已确认回滚完成的设备
+	// 绝不允许残留在持久化队列中（重启后不得被重复下发或重复计数）。
+	for _, qid := range st.RollbackQueue {
+		d, ok := st.Devices[qid]
+		if !ok || d.Phase != PhaseRollbackQueued {
+			return ErrInvalidState
+		}
+	}
 	return nil
 }

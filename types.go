@@ -44,6 +44,9 @@ const (
 	ClassInvalid
 	// ClassRetryable 可重试失败（临时故障）。
 	ClassRetryable
+	// ClassRollbackBudgetExhausted 回滚重试预算耗尽：设备可能仍停留在新固件上，
+	// 回滚停止，发布进入必须人工介入的终态。与其他失败原因明确可区分。
+	ClassRollbackBudgetExhausted
 )
 
 // DeviceReport 是设备上报给编排器的一帧报文。
@@ -130,4 +133,11 @@ type Plan struct {
 	MaxRollbackRate float64
 	// MinEvaluated 是比率判定生效所需的最少终态样本数，避免个位数样本误杀。
 	MinEvaluated int
+	// MaxRollbackAttempts 是回滚任务的独立重试预算（每台设备的回滚尝试总次数上限）。
+	// 为 0 时回退使用 MaxAttempts。预算持久化在设备记录上，重启不会把已用次数抹掉。
+	MaxRollbackAttempts int
+	// RollbackRetryInterval 是回滚失败后下一次重投的固定节奏（含边界、可复现）。
+	// 为 0 时使用 defaultRollbackRetryInterval。下次尝试时刻会持久化，
+	// 重启后未到点绝不提前重投，到点由补偿 tick 补发，不会多打一轮。
+	RollbackRetryInterval time.Duration
 }

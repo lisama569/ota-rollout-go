@@ -1,6 +1,9 @@
 package ota
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // failPlan：批次0 有 4 台设备，阈值失败率/回滚率上限 25%，最小样本 2。
 func failPlan() Plan {
@@ -180,11 +183,16 @@ func TestRetryExhaustion(t *testing.T) {
 	}
 }
 
-// TestRollbackFailureExhaustsAborts：回滚任务反复失败、耗尽 MaxAttempts 后，
-// 发布必须明确中止，而不是无限重试或假装回滚成功。
+// TestRollbackFailureExhaustsAborts：回滚任务反复失败、耗尽独立预算后，
+// 设备进入明确的人工介入终态（ClassRollbackBudgetExhausted），发布必须中止，
+// 而不是无限重试或假装回滚成功。重试按固定节奏发生，预算计数持久化。
 func TestRollbackFailureExhaustsAborts(t *testing.T) {
 	p := failPlan()
 	p.MaxAttempts = 2
+	// 固定节奏设为 0 会走默认值，这里显式给一个小间隔并在测试中用确定性时钟驱动。
+	p.RollbackRetryInterval = 50 * time.Millisecond
+	clock := newFakeClock(time.Unix(1000, 0))
+	defer clock.restore()
 	o, _, _ := newTestOrchestrator(t, p)
 	succeedDevice(t, o, "d1", 0, 1)
 	inc := upgradeFlow("d2", 0, 1, ReportUpgradeFailure, Semver{Major: 2})
@@ -195,18 +203,57 @@ func TestRollbackFailureExhaustsAborts(t *testing.T) {
 	if st := o.State(); st.Phase != RolloutRollingBack {
 		t.Fatalf("phase=%v", st.Phase)
 	}
-	// d1 回滚失败两次：第一次重试，第二次耗尽 => 中止。
+	// d1 回滚失败：预算 2 内，进入等待重试，排定 attempt 2。
 	f1 := rollbackFlow("d1", 0, 1, ReportRollbackFailure)
 	f1.ReasonCode = "rollback-flash-failed"
 	if d, _ := o.HandleReport(f1); d.Kind != DecisionRetried {
-		t.Fatalf("rollback fail #1: %v, want retried", d.Kind)
+		t.Fatalf("rollback fail #1: %v, want retried(waiting)", d.Kind)
 	}
+	st := o.State()
+	if st.Devices["d1"].Phase != PhaseRollbackWaiting || st.Devices["d1"].RollbackAttempt != 2 {
+		t.Fatalf("d1 after fail#1: phase=%v attempt=%d, want waiting/2",
+			st.Devices["d1"].Phase, st.Devices["d1"].RollbackAttempt)
+	}
+	if st.Devices["d1"].NextAttemptAt.IsZero() {
+		t.Fatal("next attempt time not persisted")
+	}
+	// 未到节奏点：tick 不得提前重投（比较 tick 前后的任务数差值）。
+	base := len(o.TransportTasksForTest())
+	o.tickForTest()
+	if n := len(o.TransportTasksForTest()) - base; n != 0 {
+		t.Fatalf("rollback redriven before cadence: %d extra tasks", n)
+	}
+	// 到点后 tick 以相同的确定性 TaskID 重投 attempt 2。
+	clock.advance(51 * time.Millisecond)
+	before := len(o.TransportTasksForTest())
+	o.tickForTest()
+	tasks := o.TransportTasksForTest()
+	if len(tasks) != before+1 || tasks[len(tasks)-1].ID != taskID("rl-test-001", 0, "d1", TaskRollback, 2) {
+		t.Fatalf("redrive tasks=%+v, want one new rollback attempt2", tasks)
+	}
+	// 重复 tick（未产生新失败）不得多打一轮。
+	o.tickForTest()
+	if n := len(o.TransportTasksForTest()); n != before+1 {
+		t.Fatalf("extra redrive dispatched: tasks=%d", n)
+	}
+	// attempt 2 再失败 => 预算耗尽，人工介入终态。
 	f2 := rollbackFlow("d1", 0, 2, ReportRollbackFailure)
 	f2.ReasonCode = "rollback-flash-failed"
-	if d, _ := o.HandleReport(f2); d.Kind != DecisionRollbackFailed {
-		t.Fatalf("rollback fail #2: %v, want rollback-failed", d.Kind)
+	d, _ := o.HandleReport(f2)
+	if d.Kind != DecisionRollbackFailed || d.Class != ClassRollbackBudgetExhausted {
+		t.Fatalf("rollback fail #2: kind=%v class=%v, want rollback-failed/rollback-budget-exhausted",
+			d.Kind, d.Class)
 	}
-	if st := o.State(); st.Phase != RolloutAborted {
+	st = o.State()
+	if st.Phase != RolloutAborted {
 		t.Fatalf("phase=%v, want aborted", st.Phase)
+	}
+	if st.Devices["d1"].Phase != PhaseRollbackFailed {
+		t.Fatalf("d1 phase=%v, want rollback-failed(manual)", st.Devices["d1"].Phase)
+	}
+	// 人工终态后 tick 不得再下发任何任务。
+	o.tickForTest()
+	if n := len(o.TransportTasksForTest()); n != before+1 {
+		t.Fatalf("tasks after manual abort=%d, want %d", n, before+1)
 	}
 }

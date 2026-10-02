@@ -31,13 +31,13 @@ func buildSimPlan() Plan {
 
 func simDevices() []*SimDevice {
 	return []*SimDevice{
-		{ID: "s1", Protocol: Semver{Major: 1}, Behavior: BehSuccess, ExtraDuplicates: 1, OutOfOrder: true},
-		{ID: "s2", Protocol: Semver{Major: 1}, Behavior: BehRetryThenSuccess, FailBefore: 1, ExtraDuplicates: 1},
-		{ID: "s3", Protocol: Semver{Major: 2}, Behavior: BehIncompatible},
-		{ID: "s4", Protocol: Semver{Major: 1}, Behavior: BehSuccess, MalformedFirst: true},
-		{ID: "s5", Protocol: Semver{Major: 1}, Behavior: BehSuccess},
-		{ID: "s6", Protocol: Semver{Major: 1}, Behavior: BehSuccess},
-		{ID: "s7", Protocol: Semver{Major: 1}, Behavior: BehSuccess},
+		{ID: "s1", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess, ExtraDuplicates: 1, OutOfOrder: true},
+		{ID: "s2", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehRetryThenSuccess, FailBefore: 1, ExtraDuplicates: 1},
+		{ID: "s3", Protocol: Semver{Major: 2}, CurrentVer: "1.0.0", Behavior: BehIncompatible},
+		{ID: "s4", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess, MalformedFirst: true},
+		{ID: "s5", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess},
+		{ID: "s6", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess},
+		{ID: "s7", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess},
 	}
 }
 
@@ -99,11 +99,11 @@ func TestSimE2ERollbackWave(t *testing.T) {
 // happyDevices 返回全成功路径的模拟设备（含重复、乱序、一次重试等扰动）。
 func happyDevices() []*SimDevice {
 	return []*SimDevice{
-		{ID: "h1", Protocol: Semver{Major: 1}, Behavior: BehSuccess, ExtraDuplicates: 1},
-		{ID: "h2", Protocol: Semver{Major: 1}, Behavior: BehSuccess, ExtraDuplicates: 1},
-		{ID: "h3", Protocol: Semver{Major: 1}, Behavior: BehSuccess, OutOfOrder: true},
-		{ID: "h4", Protocol: Semver{Major: 1}, Behavior: BehSuccess},
-		{ID: "h5", Protocol: Semver{Major: 1}, Behavior: BehSuccess},
+		{ID: "h1", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess, ExtraDuplicates: 1},
+		{ID: "h2", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess, ExtraDuplicates: 1},
+		{ID: "h3", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess, OutOfOrder: true},
+		{ID: "h4", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess},
+		{ID: "h5", Protocol: Semver{Major: 1}, CurrentVer: "1.0.0", Behavior: BehSuccess},
 	}
 }
 

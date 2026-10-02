@@ -71,26 +71,50 @@ func newTestOrchestrator(t *testing.T, p Plan) (*Orchestrator, *stubTransport, *
 	return o, tr, store
 }
 
-// upgradeFlow 构造指定设备升级尝试的上报帧。
+// upgradeFlow 构造指定设备升级尝试的上报帧。FromVer 为升级前版本（回滚基线）。
 func upgradeFlow(id DeviceID, batch BatchIndex, attempt int, kind ReportKind, proto Semver) DeviceReport {
 	return DeviceReport{
 		DeviceID: id,
 		TaskID:   taskID("rl-test-001", batch, id, TaskUpgrade, attempt),
 		Kind:     kind,
 		Protocol: proto,
+		FromVer:  "1.0.0",
 		ToVer:    "2.0.0",
 		At:       time.Now(),
 	}
 }
 
+// rollbackFlow 构造指定设备回滚尝试的上报帧。成功帧必须携带落地版本（等于基线 1.0.0）。
 func rollbackFlow(id DeviceID, batch BatchIndex, attempt int, kind ReportKind) DeviceReport {
-	return DeviceReport{
+	r := DeviceReport{
 		DeviceID: id,
 		TaskID:   taskID("rl-test-001", batch, id, TaskRollback, attempt),
 		Kind:     kind,
 		Protocol: Semver{Major: 1},
+		FromVer:  "2.0.0",
 		At:       time.Now(),
 	}
+	if kind == ReportRollbackSuccess {
+		r.ToVer = "1.0.0"
+	}
+	return r
 }
 
 var protoV1 = Semver{Major: 1}
+
+// tickForTest 在持锁状态下手动驱动一轮补偿（等价 runLoop 的一次 ticker 触发），
+// 让不跑 Run 循环的单测能确定性推进回滚泵/定时重试。
+func (o *Orchestrator) tickForTest() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.tickLocked()
+}
+
+// TransportTasksForTest 返回 stub 传输记录的任务快照（测试辅助）。
+func (o *Orchestrator) TransportTasksForTest() []Task {
+	tr, ok := o.cfg.Transport.(*stubTransport)
+	if !ok {
+		return nil
+	}
+	return tr.tasks()
+}

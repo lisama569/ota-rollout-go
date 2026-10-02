@@ -24,6 +24,9 @@ const (
 	BehIncompatible = "incompatible"
 	// BehRollbackFail：回滚任务失败（用于演练中止路径）。
 	BehRollbackFail = "rollback-fail"
+	// BehRollbackRetryThenSuccess：前 RollbackFailBefore 个回滚任务失败，之后成功，
+	// 用于演练回滚重试预算与固定重试节奏。
+	BehRollbackRetryThenSuccess = "rollback-retry-then-success"
 )
 
 // ReportAction 是模拟设备对一次任务的反应动作：延迟 Delay 后上报 Report。
@@ -41,6 +44,8 @@ type SimDevice struct {
 	Behavior string
 	// FailBefore：在 retry-then-success 下，前多少次升级任务先报可重试失败。
 	FailBefore int
+	// RollbackFailBefore：在 rollback-retry-then-success 下，前多少次回滚任务先报失败。
+	RollbackFailBefore int
 	// ExtraDuplicates：终态上报额外重复发送的次数（模拟重复/迟到重复）。
 	ExtraDuplicates int
 	// MalformedFirst：对首个升级任务先发一帧缺 TaskID 的畸形上报，再发正确上报。
@@ -67,17 +72,23 @@ func (d *SimDevice) React(task Task, target FirmwareVersion) []ReportAction {
 	switch task.Kind {
 	case TaskRollback:
 		d.rollbackAttempts++
-		if d.Behavior == BehRollbackFail {
-			r := base
+		// 回滚方向与升级相反：From 是当前在跑的目标固件，回滚任务的 target 是基线。
+		rbBase := base
+		rbBase.FromVer = target
+		failThenOK := d.Behavior == BehRollbackRetryThenSuccess &&
+			d.rollbackAttempts <= d.RollbackFailBefore
+		if d.Behavior == BehRollbackFail || failThenOK {
+			r := rbBase
 			r.Kind = ReportRollbackFailure
 			r.ReasonCode = "rollback-flash-failed"
 			r.Reason = "simulated rollback failure"
 			return []ReportAction{{Report: r}}
 		}
-		ack := base
+		ack := rbBase
 		ack.Kind = ReportAcknowledge
-		ok := base
+		ok := rbBase
 		ok.Kind = ReportRollbackSuccess
+		ok.ToVer = d.CurrentVer // 落地版本必须等于升级前基线
 		return []ReportAction{{Report: ack, Delay: time.Millisecond}, {Report: ok, Delay: 2 * time.Millisecond}}
 	}
 
