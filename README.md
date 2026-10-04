@@ -102,6 +102,23 @@ UpgradeInflight
 这是“安全的中止”，区别于 `Completed`；只有“设备卡在新固件且回滚预算耗尽”
 （`RollbackFailed`）才是需要人工介入的非安全中止。
 
+### 回滚波次的收敛条件
+
+回滚波次只有在**没有任何设备还可能处在新固件上**时才收敛。以下三类设备
+都算作“尚未处理完”（日志 `pendingOnNewFirmware=[...]` 会列出具体名单）：
+
+| 设备状态 | 为什么算未处理完 |
+| --- | --- |
+| `UpgradeInflight`（升级在途） | 任务已发出、终态未回报，设备可能已跑到新固件；升级失败、上报无效、编排器重启都不能把它当成“已离开新固件” |
+| `Upgraded`（已升级，排队等回滚名额） | 确认在新固件上，尚未下发/完成回滚 |
+| `RollbackInflight`（回滚在途） | 尚未确认落回基线；回滚中途重启同样保持等待 |
+
+因此“此刻恰好没有回滚在途、也没有设备排队”**不构成**收敛：只要还有升级
+在途的设备，发布就一直停在 `RollingBack`，等它回报最终结果——升级成功的
+按同一回滚配额排进队列，升级失败的留旧版落 `Done`。任何时刻只要还有设备
+处在新固件（含升级未结束的），发布都不会进入 `Completed`/`Aborted`。
+该等待关系持久化在设备状态里，重启恢复后同样生效（恢复时会重新评估收敛）。
+
 ### 回滚配额与排队
 
 - 回滚波次的在途配额 = 触发回滚时当前批次的 `MaxInFlight`；
@@ -199,6 +216,11 @@ go test -race -v -run TestRollbackRetryBudgetSurvivesRestart  # 重试预算跨�
 go test -race -v -run TestRollbackBaseline                 # 版本基线不符/缺失/兼容
 go test -race -v -run TestConcurrentRollbackReports        # 并发回滚上报结论唯一
 
+# 熔断时仍有设备在升级的场景（回滚波次收敛条件）：
+go test -race -v -run TestRollbackWaveWaitsForInflightUpgrade         # 在途升级成功后被纳入回滚
+go test -race -v -run TestRollbackWaveRestartWaitsForInflightUpgrade  # 中途重启仍等其结论才收口
+go test -race -v -run TestConcurrentInflightUpgradeReports            # 并发/重复上报结论唯一
+
 # 本地演示（流程走完进程自行退出，不依赖外部超时）：
 go run ./cmd/otademo -state /tmp/ota-demo.json   # 熔断 -> 配额内排队回滚 -> 安全中止
 go run ./cmd/otademo -state /tmp/ota-demo.json   # 再跑：从状态文件恢复，不重复下发
@@ -212,6 +234,8 @@ decision device=s3 task=...a1 kind=failed-incompatible report=upgrade-failure
 gate batch=0 total=4 evaluated=2 upgraded=1 rolledback=0 failed=1 inflight=1
   failRate=50.0% rbRate=0.0% (limits 25.0%/25.0%, minN=2) trigger=s3
 ROLLBACK TRIGGERED batch=0 reason="health gate violated at evaluated=2: ..."
+rollback wave status: upgradeInflight=1 rollbackInflight=0 queued=0 quota=2 pendingOnNewFirmware=[d3]
+rollback wave not converged: 1 device(s) still on (or heading to) new firmware: [d3]
 ```
 
 ## 设计取舍

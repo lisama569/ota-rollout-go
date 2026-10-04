@@ -346,16 +346,45 @@ func (o *Orchestrator) afterDeviceEventLocked(r DeviceReport) error {
 	return nil
 }
 
+// onNewFirmwareLocked 返回仍“可能处在新固件上”的设备清单，用于日志与收敛判定：
+//   - PhaseUpgradeInflight：升级任务已发出、终态未回报，可能已跑到新固件；
+//   - PhaseUpgraded：已确认在新固件，排队等回滚名额；
+//   - PhaseRollbackInflight：回滚任务在途，尚未确认落回基线。
+//
+// 升级失败、上报无效、回滚中途重启的设备都仍落在上述某一阶段，
+// 不会被误当成“已经离开新固件”。
+func (o *Orchestrator) onNewFirmwareLocked() []DeviceID {
+	var out []DeviceID
+	seen := make(map[DeviceID]bool)
+	for _, spec := range o.cfg.Plan.Batches {
+		for _, id := range spec.Devices {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			switch o.st.Devices[id].Phase {
+			case PhaseUpgradeInflight, PhaseUpgraded, PhaseRollbackInflight:
+				out = append(out, id)
+			}
+		}
+	}
+	return out
+}
+
 // evaluateRollbackLocked 判断回滚波次是否结束：
 //   - 先按配额补放排队中的回滚任务；
-//   - 没有任何设备还在新固件（upgraded 排队）或回滚在途 => 回滚完成，安全中止；
-//   - 否则保持等待，由后续设备事件或 tick 继续驱动。
+//   - 仍有设备可能在新固件上（升级在途 / 已升级排队 / 回滚在途）=> 未收敛，
+//     保持回滚中，由后续设备终态上报或 tick 继续驱动；
+//   - 所有跑到过新固件的设备都已落回基线或进入明确终态 => 回滚完成，安全中止。
 func (o *Orchestrator) evaluateRollbackLocked() error {
 	o.pumpRollbackQueueLocked()
 	s := o.statsLocked()
-	o.cfg.Logger.Printf("rollback wave status: upgradeInflight=%d rollbackInflight=%d queued=%d quota=%d",
-		s.UpgradeInflight, s.RollbackInflight, s.RollbackQueued, s.Quota)
-	if s.RollbackInflight > 0 || s.RollbackQueued > 0 {
+	pending := o.onNewFirmwareLocked()
+	o.cfg.Logger.Printf("rollback wave status: upgradeInflight=%d rollbackInflight=%d queued=%d quota=%d pendingOnNewFirmware=%v",
+		s.UpgradeInflight, s.RollbackInflight, s.RollbackQueued, s.Quota, pending)
+	if len(pending) > 0 {
+		o.cfg.Logger.Printf("rollback wave not converged: %d device(s) still on (or heading to) new firmware: %v",
+			len(pending), pending)
 		return nil
 	}
 	// 所有设备都已离开新固件：回滚波次完成，批次标记失败，发布中止。

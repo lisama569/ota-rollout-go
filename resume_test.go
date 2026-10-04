@@ -101,8 +101,23 @@ func TestResumeRollbackWave(t *testing.T) {
 	if d, err := o2.HandleReport(rollbackFlow("d1", 0, 1, ReportRollbackSuccess)); err != nil || d.Kind != DecisionRollbackSucceeded {
 		t.Fatalf("rollback after resume: %v %v", d.Kind, err)
 	}
+	// d1 已落回基线，但熔断时 d3 的升级任务还在途（配额 2 自动放量），
+	// 它可能已跑到新固件上 => 回滚波次不得收敛，发布必须保持回滚中。
+	if st := o2.State(); st.Phase != RolloutRollingBack {
+		t.Fatalf("phase=%v, want still rolling-back while d3 upgrade in-flight", st.Phase)
+	}
+	// d3 升级失败（可重试类）：回滚波次期间不再重试升级，设备留在旧版本，
+	// 作为安全终态；至此没有设备还可能在新固件上，波次收敛、安全中止。
+	fail := upgradeFlow("d3", 0, 1, ReportUpgradeFailure, protoV1)
+	fail.ReasonCode = "flash-timeout"
+	if d, err := o2.HandleReport(fail); err != nil || d.Kind != DecisionFailedRetryable {
+		t.Fatalf("d3 upgrade failure during wave: %v %v", d.Kind, err)
+	}
 	if st := o2.State(); st.Phase != RolloutAborted {
 		t.Fatalf("phase=%v, want aborted after rollback wave", st.Phase)
+	}
+	if got := o2.State().Devices["d3"].Phase; got != PhaseDone {
+		t.Fatalf("d3 phase=%v, want done (safe terminal on old firmware)", got)
 	}
 }
 
