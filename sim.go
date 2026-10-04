@@ -47,6 +47,9 @@ type SimDevice struct {
 	MalformedFirst bool
 	// OutOfOrder：成功上报先于 ACK 发出（模拟乱序）。
 	OutOfOrder bool
+	// SlowReport：给这台设备的每帧上报加一个固定的确定性长延迟。
+	// 用于稳定复现“熔断发生时该设备升级任务仍在途”的竞态窗口（不依赖随机时序）。
+	SlowReport time.Duration
 
 	upgradeAttempts  int
 	rollbackAttempts int
@@ -55,9 +58,24 @@ type SimDevice struct {
 	curVer FirmwareVersion
 }
 
+// slowActions 给设备的全部反应帧加上固定的慢延迟（确定性，无随机源）。
+func (d *SimDevice) slowActions(actions []ReportAction) []ReportAction {
+	if d.SlowReport <= 0 {
+		return actions
+	}
+	for i := range actions {
+		actions[i].Delay += d.SlowReport
+	}
+	return actions
+}
+
 // React 按行为脚本生成对某个任务的全部反应动作。
 // 每个 SimDevice 只由其专属的单个 goroutine 调用，尝试计数无需额外加锁。
 func (d *SimDevice) React(task Task, target FirmwareVersion) []ReportAction {
+	return d.slowActions(d.react(task, target))
+}
+
+func (d *SimDevice) react(task Task, target FirmwareVersion) []ReportAction {
 	now := time.Now()
 	if d.curVer == "" {
 		d.curVer = d.CurrentVer

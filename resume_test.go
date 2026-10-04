@@ -98,11 +98,26 @@ func TestResumeRollbackWave(t *testing.T) {
 	if tasks[0].ID != taskID("rl-test-001", 0, "d1", TaskRollback, 1) {
 		t.Fatalf("rollback task id changed across restart: %s", tasks[0].ID)
 	}
+	// 熔断时 d3 的升级任务也在途（配额 2：d1 成功后 d3 补位）。重启后等待关系
+	// 原样保持：在 d3 回报终态前，即便 d1 已回滚完成，波次也不能收敛。
+	if st := o2.State(); st.Devices["d3"].Phase != PhaseUpgradeInflight {
+		t.Fatalf("d3 phase=%v, want upgrade-inflight carried across restart",
+			st.Devices["d3"].Phase)
+	}
 	if d, err := o2.HandleReport(rollbackFlow("d1", 0, 1, ReportRollbackSuccess)); err != nil || d.Kind != DecisionRollbackSucceeded {
 		t.Fatalf("rollback after resume: %v %v", d.Kind, err)
 	}
+	if st := o2.State(); st.Phase != RolloutRollingBack {
+		t.Fatalf("phase=%v, must keep waiting for in-flight d3 after restart", st.Phase)
+	}
+	// d3 回报升级失败：回滚期不重试升级，留旧版作为安全终态，波次随即收敛。
+	f3 := upgradeFlow("d3", 0, 1, ReportUpgradeFailure, protoV1)
+	f3.ReasonCode = "download-timeout"
+	if d, _ := o2.HandleReport(f3); d.Kind != DecisionFailedRetryable {
+		t.Fatalf("d3 failure during rollback: %v", d.Kind)
+	}
 	if st := o2.State(); st.Phase != RolloutAborted {
-		t.Fatalf("phase=%v, want aborted after rollback wave", st.Phase)
+		t.Fatalf("phase=%v, want aborted after d3 reaches safe terminal state", st.Phase)
 	}
 }
 

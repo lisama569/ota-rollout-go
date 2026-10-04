@@ -197,3 +197,91 @@ func TestSimE2EHappyPathWithRestart(t *testing.T) {
 		}
 	}
 }
+
+// TestSimE2ECircuitBreakWithInflightUpgrade：真实通道 + goroutine + 确定性延迟下，
+// 熔断发生时恰有一台设备（s2）升级任务仍在途（慢上报）。验证：
+//   - 波次不会在 s1 回滚完成、s2 结果未到时提前安全中止；
+//   - s2 迟到的升级成功仍被纳入回滚队列、受同一在途配额约束，最终退回基线；
+//   - 收敛后发布才安全中止，没有设备停在新固件。
+func TestSimE2ECircuitBreakWithInflightUpgrade(t *testing.T) {
+	p := Plan{
+		RolloutID:       "rl-sim-003",
+		Target:          "2.0.0",
+		Protocol:        Semver{Major: 1},
+		MaxAttempts:     3,
+		MaxFailRate:     0, // 任一终态失败立即熔断
+		MaxRollbackRate: 0,
+		MinEvaluated:    1,
+		Batches: []BatchSpec{
+			{Index: 0, Devices: []DeviceID{"s1", "s2", "s3"}, MaxInFlight: 2},
+		},
+	}
+	devs := []*SimDevice{
+		{ID: "s1", Protocol: Semver{Major: 1}, Behavior: BehSuccess},
+		// s2 的升级回报显著慢：保证熔断触发时它仍是 upgrade-inflight。
+		{ID: "s2", Protocol: Semver{Major: 1}, Behavior: BehSuccess, SlowReport: 400 * time.Millisecond},
+		{ID: "s3", Protocol: Semver{Major: 2}, Behavior: BehIncompatible},
+	}
+	store := NewMemoryStore()
+	tr := newSimWith(p, devs)
+	o := NewOrchestrator(Config{Plan: p, Store: store, Transport: tr})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	trDone := make(chan struct{})
+	go func() { tr.Run(ctx); close(trDone) }()
+	done := make(chan error, 1)
+	go func() { done <- o.Run(ctx) }()
+
+	// 熔断会在 s1 成功、s3 不可兼容后很快触发；此时 s2 仍在途。
+	// 等到进入回滚波次，并确认 s1 已回滚完成而 s2 仍未给出升级结论时，
+	// 发布必须停在 rolling-back（旧实现会在此刻错误地安全中止）。
+	deadline := time.Now().Add(3 * time.Second)
+	sawWaitingOnS2 := false
+	for time.Now().Before(deadline) {
+		st := o.State()
+		if st.Phase == RolloutRollingBack &&
+			st.Devices["s1"].Phase == PhaseDone &&
+			st.Devices["s2"].Phase == PhaseUpgradeInflight {
+			sawWaitingOnS2 = true
+			t.Logf("observed wave waiting: s1=done s2=upgrade-inflight s3=incompatible phase=%s",
+				phaseName(st.Phase))
+			break
+		}
+		if st.Phase == RolloutAborted {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !sawWaitingOnS2 {
+		t.Fatal("never observed the wave held open by in-flight s2 (timing regression?)")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("e2e timed out waiting for slow s2 to finish upgrade+rollback")
+	}
+	cancel()
+	<-trDone
+
+	st := o.State()
+	if st.Phase != RolloutAborted {
+		t.Fatalf("final phase=%s, want aborted", phaseName(st.Phase))
+	}
+	for _, id := range []DeviceID{"s1", "s2", "s3"} {
+		ph := st.Devices[id].Phase
+		if ph == PhaseUpgraded || ph == PhaseUpgradeInflight || ph == PhaseRollbackInflight {
+			t.Fatalf("device %s left at %s, must not remain on new firmware", id, devicePhaseName(ph))
+		}
+	}
+	if st.Devices["s2"].Phase != PhaseDone {
+		t.Fatalf("s2 phase=%s, want done (late upgrade success was rolled back)",
+			devicePhaseName(st.Devices["s2"].Phase))
+	}
+	t.Logf("final: s1=%s s2=%s s3=%s phase=%s",
+		devicePhaseName(st.Devices["s1"].Phase), devicePhaseName(st.Devices["s2"].Phase),
+		devicePhaseName(st.Devices["s3"].Phase), phaseName(st.Phase))
+}
